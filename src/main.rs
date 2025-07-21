@@ -61,6 +61,11 @@ impl HttpResponse {
         response.add_header("Server", SERVER_NAME);
         response.add_header("Connection", "keep-alive");
         
+        // For error responses, set empty body and Content-Length: 0
+        if status_code >= 400 {
+            response.add_header("Content-Length", "0");
+        }
+        
         response
     }
     
@@ -71,6 +76,13 @@ impl HttpResponse {
     fn set_body(&mut self, body: Vec<u8>) {
         self.body = body;
         self.add_header("Content-Length", &self.body.len().to_string());
+    }
+    
+    fn set_chunked_body(&mut self, body: Vec<u8>) {
+        self.body = body;
+        self.add_header("Transfer-Encoding", "chunked");
+        // Remove Content-Length for chunked encoding
+        self.headers.remove("Content-Length");
     }
     
     fn to_bytes(&self, include_body: bool) -> Vec<u8> {
@@ -84,7 +96,15 @@ impl HttpResponse {
         
         let mut bytes = response.into_bytes();
         if include_body {
-            bytes.extend(&self.body);
+            if self.headers.get("Transfer-Encoding").map_or(false, |v| v == "chunked") {
+                // Add chunked encoding format
+                let chunk_size = format!("{:x}\r\n", self.body.len());
+                bytes.extend(chunk_size.as_bytes());
+                bytes.extend(&self.body);
+                bytes.extend(b"\r\n0\r\n\r\n"); // End chunk
+            } else {
+                bytes.extend(&self.body);
+            }
         }
         bytes
     }
@@ -258,7 +278,14 @@ async fn handle_get_request(request: &HttpRequest, allowed_file_table: &AllowedF
             let mut response = HttpResponse::new(200);
             response.add_header("Content-Type", &content_type.to_string());
             response.add_header("Access-Control-Allow-Origin", "*");
-            response.set_body(content);
+            
+            // Use chunked encoding for larger files (>1KB) if client supports HTTP/1.1
+            if content.len() > 1024 && request.version == "HTTP/1.1" {
+                response.set_chunked_body(content);
+            } else {
+                response.set_body(content);
+            }
+            
             response
         } else {
             HttpResponse::new(404) // File in allowed list but doesn't exist
@@ -280,22 +307,26 @@ async fn handle_head_request(request: &HttpRequest, allowed_file_table: &Allowed
     // Note: body exclusion is handled in handle_client
 }
 
-async fn handle_post_request(request: &HttpRequest, _allowed_file_table: &AllowedFileTable) -> HttpResponse {
+async fn handle_post_request(_request: &HttpRequest, _allowed_file_table: &AllowedFileTable) -> HttpResponse {
     // Basic POST handling - just return 201 Created for now
     let mut response = HttpResponse::new(201);
     response.add_header("Content-Type", "application/json");
-    response.set_body(b"{\"message\": \"POST request received\"}".to_vec());
+    response.set_body(b"{\"message\": \"POST request received\", \"status\": \"success\"}".to_vec());
     response
 }
 
-async fn handle_put_request(request: &HttpRequest, _allowed_file_table: &AllowedFileTable) -> HttpResponse {
+async fn handle_put_request(_request: &HttpRequest, _allowed_file_table: &AllowedFileTable) -> HttpResponse {
     // Basic PUT handling - return 204 No Content
-    HttpResponse::new(204)
+    let mut response = HttpResponse::new(204);
+    response.add_header("Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS");
+    response
 }
 
-async fn handle_delete_request(request: &HttpRequest, _allowed_file_table: &AllowedFileTable) -> HttpResponse {
+async fn handle_delete_request(_request: &HttpRequest, _allowed_file_table: &AllowedFileTable) -> HttpResponse {
     // Basic DELETE handling - return 204 No Content
-    HttpResponse::new(204)
+    let mut response = HttpResponse::new(204);
+    response.add_header("Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS");
+    response
 }
 
 async fn handle_options_request(_request: &HttpRequest) -> HttpResponse {
@@ -331,7 +362,7 @@ async fn send_content(path: &str, socket: &mut TcpStream) {
 }
 
 fn create_allowed_file_table() -> Vec<String> {
-    let paths = vec!["./public/index.html", "./public/style.css"];
+    let paths = vec!["./public/index.html", "./public/style.css", "./public/large.html"];
     let mut table = Vec::new();
     for path in paths {
         if Path::new(path).exists() {
